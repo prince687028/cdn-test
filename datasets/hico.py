@@ -91,9 +91,8 @@ class HICODetection(torch.utils.data.Dataset):
                 img_0, target_0 = self._transforms[0](img, target)
                 img, target = self._transforms[1](img_0, target_0)
             
-            # clip embedding
+            # image clip feature
             clip_inputs = self.clip_preprocess(img_0)
-            # print(clip_inputs.shape)
             target['clip_inputs'] = clip_inputs
 
             kept_box_indices = [label[0] for label in target['labels']]
@@ -111,7 +110,7 @@ class HICODetection(torch.utils.data.Dataset):
                 if hoi['subject_id'] not in kept_box_indices or hoi['object_id'] not in kept_box_indices:
                     continue
 
-                # verb_obj_pair = ?
+                # verb_obj_pair
                 verb_obj_pair = (self._valid_verb_ids.index(hoi['category_id']),
                         target['labels'][kept_box_indices.index(hoi['object_id'])])
                 # set postive verb_obj_pair label to one

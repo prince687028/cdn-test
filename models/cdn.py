@@ -91,7 +91,6 @@ class CDN(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed_h, query_embed_o, pos_embed):
-        # key: figure out the dim of params
         # bs = 2, c = 256
         bs, c, h, w = src.shape
 
@@ -106,6 +105,7 @@ class CDN(nn.Module):
         query_embed_o = query_embed_o.unsqueeze(1).repeat(1, bs, 1)
         query_embed_h = query_embed_h.unsqueeze(1).repeat(1, bs, 1)
         # query_embed.shape = querys, bs, c
+        
         # cat sub and obj query
         ins_query_embed = torch.cat((query_embed_h, query_embed_o), dim=0)
 
@@ -113,6 +113,7 @@ class CDN(nn.Module):
         # mask.shape = bs, wh
 
         tgt = torch.zeros_like(ins_query_embed)
+        
         # memory.shape = wh, bs = 2, c = 256
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
         
@@ -128,7 +129,6 @@ class CDN(nn.Module):
 
         vector = self.map_to_vector(clip_feature).permute(2, 1, 0)
         clip_vector_0 = self.clip_vector(vector)
-        # print(vector.shape)
         
         clip_vector = clip_vector_0 / clip_vector_0.norm(dim = -1, keepdim = True)
         outputs_clip_logits = self.cal_clip_logits(clip_vector)
@@ -157,7 +157,7 @@ class CDN(nn.Module):
         h_out = hopd_out[:, :, :num_queries, :]
         o_out = hopd_out[:, :, num_queries:, :]
 
-        # interaction_query_embed = hopd_out[-1]
+        # interaction_query_embed = human & object query + feature query
         interaction_query_embed = (h_out[-1] + o_out[-1]) / 2.0 + feature_query
 
         interaction_query_embed = interaction_query_embed.permute(1, 0, 2)
@@ -168,7 +168,7 @@ class CDN(nn.Module):
                                   pos=pos_embed, query_pos=interaction_query_embed)
         interaction_decoder_out = interaction_decoder_out.transpose(1, 2)
 
-        # need add the output of the clip_encoder
+        # need add the output of the clip
         return h_out, o_out, interaction_decoder_out, outputs_clip_logits, clip_vector_0, memory.permute(1, 2, 0).view(bs, c, h, w)
 
 

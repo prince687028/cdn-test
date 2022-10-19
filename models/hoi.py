@@ -57,10 +57,6 @@ class CDNHOI(nn.Module):
                     self.query_embed_h.weight, 
                     self.query_embed_o.weight,
                     pos[-1])[:5]
-
-        # print(outputs_clip_logits.shape)
-        # print(clip_vector.shape)
-
         # outputs_clip_logits.shape = 1, bs, 600
 
         outputs_sub_coord = self.sub_bbox_embed(h_out).sigmoid()
@@ -71,8 +67,6 @@ class CDNHOI(nn.Module):
             outputs_matching = self.matching_embed(hopd_out)
 
         outputs_verb_class = self.verb_class_embed(inter_out)
-        
-        # outputs_obj_class[-1].shape = 2, 64, 81(bs, querys, types)
 
         # add pred_clip into out list
         out = {'pred_obj_logits': outputs_obj_class[-1], 'pred_verb_logits': outputs_verb_class[-1],

@@ -20,6 +20,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
+    parser.add_argument('--lr-clip', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=90, type=int)
@@ -105,6 +106,7 @@ def get_args_parser():
                         help="Relative classification weight of the no-object class")
     # add clip loss weight 
     parser.add_argument('--clip_loss_coef', default=1, type=float)
+    parser.add_argument('--mimic_loss_coef', default=1, type=float)
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
@@ -124,6 +126,10 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
 
+    # clip
+    parser.add_argument("--clip_model", default='ViT-B/32',
+                         help='clip pretrained model path')
+    
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
@@ -184,13 +190,24 @@ def main(args):
             if args.use_matching and 'matching_embed' in name:
                 p.requires_grad = True
 
+    # clip params lr = 1e-5
     param_dicts = [
-        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if 
+                        "backbone" not in n and "cal_clip_logits" not in n and p.requires_grad]
+        },
+        {
+            "params": [p for n, p in model_without_ddp.named_parameters() if 
+                        "backbone" in n and p.requires_grad],
             "lr": args.lr_backbone,
         },
+        {
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                        "cal_clip_logits" in n and p.requires_grad],
+            "lr": args.lr_clip,
+        },
     ]
+
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)

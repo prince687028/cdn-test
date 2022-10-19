@@ -5,7 +5,6 @@ from torch import nn
 import torch.nn.functional as F
 
 import clip
-from datasets.hico_text_label import hico_text_label
 
 from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -19,6 +18,9 @@ from .backbone import build_backbone
 from .matcher import build_matcher
 from .cdn import build_cdn
 
+def _sigmoid(x):
+    y = torch.clamp(x.sigmoid(), min = 1e-4, max = 1 - 1e-4)
+    return y
 
 class CDNHOI(nn.Module):
 
@@ -27,7 +29,8 @@ class CDNHOI(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed_h = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed_o = nn.Embedding(num_queries, hidden_dim)
         self.obj_class_embed = nn.Linear(hidden_dim, num_obj_classes + 1)
         self.verb_class_embed = nn.Linear(hidden_dim, num_verb_classes)
         self.sub_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -40,36 +43,6 @@ class CDNHOI(nn.Module):
         self.dec_layers_interaction = args.dec_layers_interaction
         if self.use_matching:
             self.matching_embed = nn.Linear(hidden_dim, 2)
-        
-        # add something about clip, refer to test_clip.py
-        hoi_text_label = hico_text_label
-        self.clip_label, _ = self.init_classifier_with_CLIP(hoi_text_label)
-
-        self.cal_clip_logits = nn.Linear(512, 600)
-        self.cal_clip_logits.weight.data = self.clip_label / self.clip_label.norm(dim=-1, keepdim = True)
-
-        self.map_to_vector = nn.AdaptiveMaxPool1d(1)
-        self.clip_vector = nn.Sequential(
-            nn.Linear(hidden_dim, 512), # 512 refer to clip_embed_dim
-            nn.LayerNorm(512), # 512--the same as Linear
-        )
-        
-    def init_classifier_with_CLIP(self, hoi_text_label):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        text_inputs = torch.cat([clip.tokenize(hoi_text_label[id]) for id in hoi_text_label.keys()])
-
-        clip_model_param = 'ViT-B/32'
-    
-        clip_model, preprocess = clip.load(clip_model_param, device=device)
-    
-        with torch.no_grad():
-            text_embedding = clip_model.encode_text(text_inputs.to(device))
-
-            v_linear_proj_weight = clip_model.visual.proj.detach()
-
-        del clip_model
-
-        return text_embedding.float(),  v_linear_proj_weight.float()
     
     def forward(self, samples: NestedTensor):
         if not isinstance(samples, NestedTensor):
@@ -78,49 +51,33 @@ class CDNHOI(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        hopd_out, interaction_decoder_out, clip_feature = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[:3]
-
-        # after transformer, a pooling layer is needed 
-        # and the obtained vector will dot with clip_labels 
-        # [batchsize * 512] dot [512 * 600] equals [bs * 600]
-        # sever as out['pred_clip_logits']
-
-        clip_feature = clip_feature.permute(2, 1, 0)
-
-        vector = self.map_to_vector(clip_feature).permute(2, 1, 0)
-        clip_vector = self.clip_vector(vector)
-
-        # vector.shape = 1, bs, 256, clip_vector.shape = 1, bs, 512
-        # self.clip_label.shape = 600, 512
-        
-        # old method, which has been replaced
-        # clip_labels = torch.unsqueeze(self.clip_label, 1).repeat(1, clip_vector.shape[1], 1)
-
-        # outputs_clip_logits = torch.matmul(clip_vector.permute(1, 0, 2), clip_labels.permute(1, 2, 0))
-        # outputs_clip_logits = torch.squeeze(outputs_clip_logits)
-
-        # new method
-        clip_vector = clip_vector / clip_vector.norm(dim = -1, keepdim = True)
-        outputs_clip_logits = self.cal_clip_logits(clip_vector)
+        h_out, o_out, inter_out, outputs_clip_logits, clip_vector = self.transformer(
+                    self.input_proj(src),
+                    mask, 
+                    self.query_embed_h.weight, 
+                    self.query_embed_o.weight,
+                    pos[-1])[:5]
 
         # print(outputs_clip_logits.shape)
+        # print(clip_vector.shape)
 
         # outputs_clip_logits.shape = 1, bs, 600
 
-        outputs_sub_coord = self.sub_bbox_embed(hopd_out).sigmoid()
-        outputs_obj_coord = self.obj_bbox_embed(hopd_out).sigmoid()
-        outputs_obj_class = self.obj_class_embed(hopd_out)
+        outputs_sub_coord = self.sub_bbox_embed(h_out).sigmoid()
+        outputs_obj_coord = self.obj_bbox_embed(o_out).sigmoid()
+        outputs_obj_class = self.obj_class_embed(o_out)
         if self.use_matching:
+            hopd_out = torch.cat((h_out, o_out), dim=0)
             outputs_matching = self.matching_embed(hopd_out)
 
-        outputs_verb_class = self.verb_class_embed(interaction_decoder_out)
+        outputs_verb_class = self.verb_class_embed(inter_out)
         
         # outputs_obj_class[-1].shape = 2, 64, 81(bs, querys, types)
 
         # add pred_clip into out list
         out = {'pred_obj_logits': outputs_obj_class[-1], 'pred_verb_logits': outputs_verb_class[-1],
                'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_obj_coord[-1],
-               'pred_clip_logits': outputs_clip_logits}
+               'pred_clip_logits': outputs_clip_logits, 'pred_clip_feats': clip_vector}
         if self.use_matching:
             out['pred_matching_logits'] = outputs_matching[-1]
 
@@ -178,6 +135,9 @@ class SetCriterionHOI(nn.Module):
         empty_weight = torch.ones(self.num_obj_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.clip_model, _ = clip.load(args.clip_model, device=device)
 
         self.alpha = args.alpha
 
@@ -308,11 +268,26 @@ class SetCriterionHOI(nn.Module):
         # setup clip loss
         assert 'pred_clip_logits' in outputs
         src_logits = torch.squeeze(outputs['pred_clip_logits'])
+        src_logits = _sigmoid(src_logits)
 
         targets_classes = torch.cat([t['hoi_clip_labels'] for t in targets])
 
-        loss_clip_ce = F.cross_entropy(src_logits.float(), targets_classes.float())
+        loss_clip_ce = self._neg_loss(src_logits, targets_classes, weights=None, alpha=self.alpha)
         losses = {'loss_clip_ce': loss_clip_ce}
+        return losses
+    
+    def loss_mimic(self, outputs, targets, indices, num_interactions):
+        # setup mimic loss
+        assert 'pred_clip_feats' in outputs
+        src_feats = torch.squeeze(outputs['pred_clip_feats'])
+
+        targets_clip_inputs = torch.cat([t['clip_inputs'].unsqueeze(0) for t in targets])
+
+        with torch.no_grad():
+            targets_clip_feats = self.clip_model.encode_image(targets_clip_inputs)
+        
+        loss_mimic = F.l1_loss(src_feats, targets_clip_feats)
+        losses = {'loss_mimic': loss_mimic}
         return losses
 
     def loss_verb_labels(self, outputs, targets, indices, num_interactions):
@@ -438,7 +413,8 @@ class SetCriterionHOI(nn.Module):
             'verb_labels': self.loss_verb_labels,
             'sub_obj_boxes': self.loss_sub_obj_boxes,
             'matching_labels': self.loss_matching_labels,
-            'clip_labels': self.loss_clip_labels
+            'clip_labels': self.loss_clip_labels,
+            'clip_mimic':self.loss_mimic,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num, **kwargs)
@@ -466,7 +442,7 @@ class SetCriterionHOI(nn.Module):
                     if loss == 'obj_labels':
                         kwargs = {'log': False}
                     # add continue
-                    if loss == 'clip_labels':
+                    if loss == 'clip_labels' or loss == 'clip_mimic':
                         continue
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_interactions, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
@@ -558,6 +534,7 @@ def build(args):
 
     # set weight
     weight_dict['loss_clip_ce'] = args.clip_loss_coef
+    weight_dict['loss_mimic'] = args.mimic_loss_coef
 
     if args.use_matching:
         weight_dict['loss_matching'] = args.matching_loss_coef
@@ -569,8 +546,8 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality', 'clip_labels']
-    # losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality']
+    # losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality', 'clip_labels']
+    losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality', 'clip_labels', 'clip_mimic']
     if args.use_matching:
         losses.append('matching_labels')
 

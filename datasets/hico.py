@@ -3,6 +3,7 @@ from PIL import Image
 import json
 from collections import defaultdict
 import numpy as np
+import clip
 
 from datasets.hico_text_label import hico_text_label
 
@@ -15,7 +16,7 @@ import datasets.transforms as T
 
 class HICODetection(torch.utils.data.Dataset):
 
-    def __init__(self, img_set, img_folder, anno_file, transforms, num_queries):
+    def __init__(self, img_set, img_folder, anno_file, transforms, num_queries, args):
         self.img_set = img_set
         self.img_folder = img_folder
         with open(anno_file, 'r') as f:
@@ -46,6 +47,9 @@ class HICODetection(torch.utils.data.Dataset):
             self.ids = list(range(len(self.annotations)))
 
         self.hoi_text_label = list(hico_text_label.keys())
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _, self.clip_preprocess = clip.load(args.clip_model, device=device)
 
     def __len__(self):
         return len(self.ids)
@@ -84,7 +88,13 @@ class HICODetection(torch.utils.data.Dataset):
             target['area'] = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
 
             if self._transforms is not None:
-                img, target = self._transforms(img, target)
+                img_0, target_0 = self._transforms[0](img, target)
+                img, target = self._transforms[1](img_0, target_0)
+            
+            # clip embedding
+            clip_inputs = self.clip_preprocess(img_0)
+            # print(clip_inputs.shape)
+            target['clip_inputs'] = clip_inputs
 
             kept_box_indices = [label[0] for label in target['labels']]
 
@@ -195,7 +205,7 @@ def make_hico_transforms(image_set):
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 
     if image_set == 'train':
-        return T.Compose([
+        return [T.Compose([
             T.RandomHorizontalFlip(),
             T.ColorJitter(.4, .4, .4),
             T.RandomSelect(
@@ -204,10 +214,10 @@ def make_hico_transforms(image_set):
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
                     T.RandomResize(scales, max_size=1333),
-                ])
+                ]))]
             ),
             normalize,
-        ])
+        ]
 
     if image_set == 'val':
         return T.Compose([
@@ -229,7 +239,7 @@ def build(image_set, args):
 
     img_folder, anno_file = PATHS[image_set]
     dataset = HICODetection(image_set, img_folder, anno_file, transforms=make_hico_transforms(image_set),
-                            num_queries=args.num_queries)
+                            num_queries=args.num_queries, args = args)
     if image_set == 'val':
         dataset.set_rare_hois(PATHS['train'][1])
         dataset.load_correct_mat(CORRECT_MAT_PATH)

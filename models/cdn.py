@@ -5,6 +5,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
+import clip
+from datasets.hico_text_label import hico_text_label
+
+def _sigmoid(x):
+    y = torch.clamp(x.sigmoid(), min = 1e-4, max = 1 - 1e-4)
+    return y
 
 class CDN(nn.Module):
 
@@ -45,12 +51,46 @@ class CDN(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
 
+        # add something about clip, refer to test_clip.py
+        hoi_text_label = hico_text_label
+        self.clip_label, _ = self.init_classifier_with_CLIP(hoi_text_label)
+
+        self.cal_clip_logits = nn.Linear(512, 600)
+        self.cal_clip_logits.weight.data = self.clip_label / self.clip_label.norm(dim=-1, keepdim = True)
+
+        self.map_to_vector = nn.AdaptiveAvgPool1d(1)
+        self.clip_vector = nn.Sequential(
+            nn.Linear(d_model, 512), # 512 is clip_embed_dim
+            nn.LayerNorm(512),
+        )
+        self.vector_to_query = nn.Sequential(
+            nn.Linear(512, d_model), # 256 is query's c dim
+            nn.LayerNorm(d_model),
+        )
+
+    def init_classifier_with_CLIP(self, hoi_text_label):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        text_inputs = torch.cat([clip.tokenize(hoi_text_label[id]) for id in hoi_text_label.keys()])
+
+        clip_model_param = 'ViT-B/32'
+    
+        clip_model, preprocess = clip.load(clip_model_param, device=device)
+    
+        with torch.no_grad():
+            text_embedding = clip_model.encode_text(text_inputs.to(device))
+
+            v_linear_proj_weight = clip_model.visual.proj.detach()
+
+        del clip_model
+
+        return text_embedding.float(),  v_linear_proj_weight.float()
+
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed):
+    def forward(self, src, mask, query_embed_h, query_embed_o, pos_embed):
         # key: figure out the dim of params
         # bs = 2, c = 256
         bs, c, h, w = src.shape
@@ -61,36 +101,75 @@ class CDN(nn.Module):
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
         # pos_embed.shape = src.shape
 
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        num_queries = query_embed_h.shape[0]
+
+        query_embed_o = query_embed_o.unsqueeze(1).repeat(1, bs, 1)
+        query_embed_h = query_embed_h.unsqueeze(1).repeat(1, bs, 1)
         # query_embed.shape = querys, bs, c
+        # cat sub and obj query
+        ins_query_embed = torch.cat((query_embed_h, query_embed_o), dim=0)
 
         mask = mask.flatten(1)
         # mask.shape = bs, wh
 
-        tgt = torch.zeros_like(query_embed)
+        tgt = torch.zeros_like(ins_query_embed)
         # memory.shape = wh, bs = 2, c = 256
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
         
         # need add the structure of clip_encoder
-        clip_feature = self.clip_encoder(memory, src_key_padding_mask=mask, pos=pos_embed)
+        clip_feature_0 = self.clip_encoder(memory, src_key_padding_mask=mask, pos=pos_embed)
         # clip_feature.shape = wh, bs = 2, c = 256
 
+        # after transformer encodeer, a pooling layer is needed 
+        # and the obtained vector will dot with clip_labels 
+        # [batchsize * 512] dot [512 * 600] equals [bs * 600]
+        # sever as out['pred_clip_logits']
+        clip_feature = clip_feature_0.permute(2, 1, 0)
+
+        vector = self.map_to_vector(clip_feature).permute(2, 1, 0)
+        clip_vector_0 = self.clip_vector(vector)
+        # print(vector.shape)
+        
+        clip_vector = clip_vector_0 / clip_vector_0.norm(dim = -1, keepdim = True)
+        outputs_clip_logits = self.cal_clip_logits(clip_vector)
+        # outputs_clip_logits.shape = 1, bs, 600
+
+        # sigmoid, select top16, softmax
+        clip_logits = _sigmoid(torch.squeeze(outputs_clip_logits))
+        res_k, res_idx = torch.topk(clip_logits, 16, dim=1)
+        res_k = torch.softmax(res_k, dim=1)
+
+        # select embedding and multiply weight
+        res_embedding_0 = self.clip_label[res_idx,:]
+        res_embedding = torch.mul(res_k.unsqueeze(2), res_embedding_0)
+
+        # sum, dim 512 --> 256
+        feature_query_0 = res_embedding.sum(dim=1)
+        # feature_query_0.shape = bs * 512
+        feature_query = self.vector_to_query(feature_query_0)
+        feature_query = feature_query.unsqueeze(1).repeat(1, num_queries, 1)
+
         hopd_out = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)
+                          pos=pos_embed, query_pos=ins_query_embed)
         hopd_out = hopd_out.transpose(1, 2)
         # hopd_out.shape = layers, bs, querys, c
 
-        interaction_query_embed = hopd_out[-1]
+        h_out = hopd_out[:, :, :num_queries, :]
+        o_out = hopd_out[:, :, num_queries:, :]
+
+        # interaction_query_embed = hopd_out[-1]
+        interaction_query_embed = (h_out[-1] + o_out[-1]) / 2.0 + feature_query
+
         interaction_query_embed = interaction_query_embed.permute(1, 0, 2)
         # shape = querys, bs, c
 
         interaction_tgt = torch.zeros_like(interaction_query_embed)
-        interaction_decoder_out = self.interaction_decoder(interaction_tgt, memory, memory_key_padding_mask=mask,
+        interaction_decoder_out = self.interaction_decoder(interaction_tgt, clip_feature_0, memory_key_padding_mask=mask,
                                   pos=pos_embed, query_pos=interaction_query_embed)
         interaction_decoder_out = interaction_decoder_out.transpose(1, 2)
 
         # need add the output of the clip_encoder
-        return hopd_out, interaction_decoder_out, clip_feature, memory.permute(1, 2, 0).view(bs, c, h, w)
+        return h_out, o_out, interaction_decoder_out, outputs_clip_logits, clip_vector_0, memory.permute(1, 2, 0).view(bs, c, h, w)
 
 
 class TransformerEncoder(nn.Module):

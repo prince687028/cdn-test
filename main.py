@@ -100,6 +100,7 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=1, type=float)
     parser.add_argument('--obj_loss_coef', default=1, type=float)
     parser.add_argument('--verb_loss_coef', default=2, type=float)
+    parser.add_argument('--hoi_loss_coef', default=1, type=float)
     parser.add_argument('--alpha', default=0.5, type=float, help='focal loss alpha')
     parser.add_argument('--matching_loss_coef', default=1, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
@@ -155,6 +156,11 @@ def get_args_parser():
     parser.add_argument('--nms_beta', default=0.5, type=float)
     parser.add_argument('--json_file', default='results.json', type=str)
 
+    # zero shot type
+    parser.add_argument('--zero_shot_type', default='default',
+                        help='default, rare_first, non_rare_first, unseen_object, unseen_verb')
+    parser.add_argument('--del_unseen', action='store_true', help='')
+
     return parser
 
 
@@ -194,7 +200,7 @@ def main(args):
     param_dicts = [
         {
             "params": [p for n, p in model_without_ddp.named_parameters() if 
-                        "backbone" not in n and "cal_clip_logits" not in n and p.requires_grad]
+                        "backbone" not in n and "cal_clip_logits" not in n and "hoi_class_embed" not in n and p.requires_grad]
         },
         {
             "params": [p for n, p in model_without_ddp.named_parameters() if 
@@ -203,7 +209,7 @@ def main(args):
         },
         {
             "params": [p for n, p in model_without_ddp.named_parameters() if
-                        "cal_clip_logits" in n and p.requires_grad],
+                        ("cal_clip_logits" in n or "hoi_class_embed" in n) and p.requires_grad],
             "lr": args.lr_clip,
         },
     ]

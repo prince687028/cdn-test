@@ -26,12 +26,11 @@ class CDN(nn.Module):
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
-        # need 2 layers encoder for clip, e.g. self.encoder_for_clip = Trans...
+        # need 2 layers encoder for clip
         clip_encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         clip_encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.clip_encoder = TransformerEncoder(clip_encoder_layer, 2, clip_encoder_norm)
-        # finished
         
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
@@ -117,11 +116,11 @@ class CDN(nn.Module):
         # memory.shape = wh, bs = 2, c = 256
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
         
-        # need add the structure of clip_encoder
+        # add the structure of clip_encoder
         clip_feature_0 = self.clip_encoder(memory, src_key_padding_mask=mask, pos=pos_embed)
         # clip_feature.shape = wh, bs = 2, c = 256
 
-        # after transformer encodeer, a pooling layer is needed 
+        # after transformer encoder, a pooling layer is needed 
         # and the obtained vector will dot with clip_labels 
         # [batchsize * 512] dot [512 * 600] equals [bs * 600]
         # sever as out['pred_clip_logits']

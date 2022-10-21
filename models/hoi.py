@@ -33,6 +33,7 @@ class CDNHOI(nn.Module):
         self.query_embed_o = nn.Embedding(num_queries, hidden_dim)
         self.obj_class_embed = nn.Linear(hidden_dim, num_obj_classes + 1)
         self.verb_class_embed = nn.Linear(hidden_dim, num_verb_classes)
+        self.hoi_class_embed = nn.Linear(hidden_dim, 600) # 600 is hoi types
         self.sub_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.obj_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
@@ -67,11 +68,13 @@ class CDNHOI(nn.Module):
             outputs_matching = self.matching_embed(hopd_out)
 
         outputs_verb_class = self.verb_class_embed(inter_out)
+        outputs_hoi_class = self.hoi_class_embed(inter_out)
 
         # add pred_clip into out list
         out = {'pred_obj_logits': outputs_obj_class[-1], 'pred_verb_logits': outputs_verb_class[-1],
                'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_obj_coord[-1],
-               'pred_clip_logits': outputs_clip_logits, 'pred_clip_feats': clip_vector}
+               'pred_clip_logits': outputs_clip_logits, 'pred_clip_feats': clip_vector, 
+               'pred_hoi_logits': outputs_hoi_class[-1]}
         if self.use_matching:
             out['pred_matching_logits'] = outputs_matching[-1]
 
@@ -79,26 +82,28 @@ class CDNHOI(nn.Module):
             if self.use_matching:
                 out['aux_outputs'] = self._set_aux_loss(outputs_obj_class, outputs_verb_class,
                                                         outputs_sub_coord, outputs_obj_coord,
-                                                        outputs_matching)
+                                                        outputs_hoi_class, outputs_matching)
             else:                                            
                 out['aux_outputs'] = self._set_aux_loss(outputs_obj_class, outputs_verb_class,
-                                                        outputs_sub_coord, outputs_obj_coord)
+                                                        outputs_sub_coord, outputs_obj_coord,
+                                                        outputs_hoi_class)
 
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_obj_class, outputs_verb_class, outputs_sub_coord, outputs_obj_coord, outputs_matching=None):
+    def _set_aux_loss(self, outputs_obj_class, outputs_verb_class, outputs_sub_coord, outputs_obj_coord, outputs_hoi_class, outputs_matching=None):
         min_dec_layers_num = min(self.dec_layers_hopd, self.dec_layers_interaction)
         if self.use_matching:
             return [{'pred_obj_logits': a, 'pred_verb_logits': b, 'pred_sub_boxes': c, \
-                     'pred_obj_boxes': d, 'pred_matching_logits': e}
-                    for a, b, c, d, e in zip(outputs_obj_class[-min_dec_layers_num : -1], outputs_verb_class[-min_dec_layers_num : -1], \
+                     'pred_obj_boxes': d, 'pred_matching_logits': e, 'pred_hoi_logits': f}
+                    for a, b, c, d, e, f in zip(outputs_obj_class[-min_dec_layers_num : -1], outputs_verb_class[-min_dec_layers_num : -1], \
                                              outputs_sub_coord[-min_dec_layers_num : -1], outputs_obj_coord[-min_dec_layers_num : -1], \
-                                             outputs_matching[-min_dec_layers_num : -1])]
+                                             outputs_matching[-min_dec_layers_num : -1], outputs_hoi_class[-min_dec_layers_num : -1])]
         else:
-            return [{'pred_obj_logits': a, 'pred_verb_logits': b, 'pred_sub_boxes': c, 'pred_obj_boxes': d}
-                    for a, b, c, d in zip(outputs_obj_class[-min_dec_layers_num : -1], outputs_verb_class[-min_dec_layers_num : -1], \
-                                          outputs_sub_coord[-min_dec_layers_num : -1], outputs_obj_coord[-min_dec_layers_num : -1])]
+            return [{'pred_obj_logits': a, 'pred_verb_logits': b, 'pred_sub_boxes': c, 'pred_obj_boxes': d, 'pred_hoi_logits': e}
+                    for a, b, c, d, e in zip(outputs_obj_class[-min_dec_layers_num : -1], outputs_verb_class[-min_dec_layers_num : -1], \
+                                          outputs_sub_coord[-min_dec_layers_num : -1], outputs_obj_coord[-min_dec_layers_num : -1],
+                                          outputs_hoi_class[-min_dec_layers_num : -1])]
 
 
 class MLP(nn.Module):
@@ -283,6 +288,24 @@ class SetCriterionHOI(nn.Module):
         loss_mimic = F.l1_loss(src_feats, targets_clip_feats)
         losses = {'loss_mimic': loss_mimic}
         return losses
+    
+    def loss_hoi_labels(self, outputs, targets, indices, num_interactions):
+        assert 'pred_hoi_logits' in outputs
+        src_logits = outputs['pred_hoi_logits']
+        # print(src_logits.shape)
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t['hoi_labels'][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.zeros_like(src_logits)
+        # print(target_classes_o.shape)
+        # print(target_classes.shape)
+        target_classes[idx] = target_classes_o
+
+        src_logits = _sigmoid(src_logits)
+        loss_hoi_ce = self._neg_loss(src_logits, target_classes, weights=None, alpha=self.alpha)
+        losses = {'loss_hoi_labels': loss_hoi_ce}
+
+        return losses
 
     def loss_verb_labels(self, outputs, targets, indices, num_interactions):
         assert 'pred_verb_logits' in outputs
@@ -404,7 +427,7 @@ class SetCriterionHOI(nn.Module):
         loss_map = {
             'obj_labels': self.loss_obj_labels,
             'obj_cardinality': self.loss_obj_cardinality,
-            'verb_labels': self.loss_verb_labels,
+            'hoi_labels': self.loss_hoi_labels,
             'sub_obj_boxes': self.loss_sub_obj_boxes,
             'matching_labels': self.loss_matching_labels,
             'clip_labels': self.loss_clip_labels,
@@ -455,24 +478,28 @@ class PostProcessHOI(nn.Module):
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
         out_obj_logits = outputs['pred_obj_logits']
-        out_verb_logits = outputs['pred_verb_logits']
+        # out_verb_logits = outputs['pred_verb_logits']
+        out_hoi_logits = outputs['pred_hoi_logits']
         out_sub_boxes = outputs['pred_sub_boxes']
         out_obj_boxes = outputs['pred_obj_boxes']
 
         assert len(out_obj_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
-        obj_prob = F.softmax(out_obj_logits, -1)
-        obj_scores, obj_labels = obj_prob[..., :-1].max(-1)
+        # obj_prob = F.softmax(out_obj_logits, -1)
+        # obj_scores, obj_labels = obj_prob[..., :-1].max(-1)
+        obj_scores = out_obj_logits.sigmoid()
+        obj_labels = F.softmax(out_obj_logits, -1)[..., :-1].max(-1)[1]
 
-        verb_scores = out_verb_logits.sigmoid()
+        # verb_scores = out_verb_logits.sigmoid()
+        hoi_scores = out_hoi_logits.sigmoid()
 
         if self.use_matching:
             out_matching_logits = outputs['pred_matching_logits']
             matching_scores = F.softmax(out_matching_logits, -1)[..., 1]
 
         img_h, img_w = target_sizes.unbind(1)
-        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1).to(verb_scores.device)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1).to(hoi_scores.device)
         sub_boxes = box_cxcywh_to_xyxy(out_sub_boxes)
         sub_boxes = sub_boxes * scale_fct[:, None, :]
         obj_boxes = box_cxcywh_to_xyxy(out_obj_boxes)
@@ -480,21 +507,23 @@ class PostProcessHOI(nn.Module):
 
         results = []
         for index in range(len(obj_scores)):
-            os, ol, vs, sb, ob =  obj_scores[index], obj_labels[index], verb_scores[index], sub_boxes[index], obj_boxes[index]
+            os, ol, hs, sb, ob =  obj_scores[index], obj_labels[index], hoi_scores[index], sub_boxes[index], obj_boxes[index]
             sl = torch.full_like(ol, self.subject_category_id)
             l = torch.cat((sl, ol))
             b = torch.cat((sb, ob))
             results.append({'labels': l.to('cpu'), 'boxes': b.to('cpu')})
 
-            vs = vs * os.unsqueeze(1)
+            # vs = vs * os.unsqueeze(1)
 
-            if self.use_matching:
-                ms = matching_scores[index]
-                vs = vs * ms.unsqueeze(1)
+            # if self.use_matching:
+            #     ms = matching_scores[index]
+                # vs = vs * ms.unsqueeze(1)
 
             ids = torch.arange(b.shape[0])
 
-            results[-1].update({'verb_scores': vs.to('cpu'), 'sub_ids': ids[:ids.shape[0] // 2],
+            results[-1].update({'hoi_scores': hs.to('cpu'), 
+                                'obj_scores': os.to('cpu'),
+                                'sub_ids': ids[:ids.shape[0] // 2],
                                 'obj_ids': ids[ids.shape[0] // 2:]})
 
         return results
@@ -520,7 +549,7 @@ def build(args):
     matcher = build_matcher(args)
     weight_dict = {}
     weight_dict['loss_obj_ce'] = args.obj_loss_coef
-    weight_dict['loss_verb_ce'] = args.verb_loss_coef
+    # weight_dict['loss_verb_ce'] = args.verb_loss_coef
     weight_dict['loss_sub_bbox'] = args.bbox_loss_coef
     weight_dict['loss_obj_bbox'] = args.bbox_loss_coef
     weight_dict['loss_sub_giou'] = args.giou_loss_coef
@@ -529,6 +558,7 @@ def build(args):
     # set weight
     weight_dict['loss_clip_ce'] = args.clip_loss_coef
     weight_dict['loss_mimic'] = args.mimic_loss_coef
+    weight_dict['loss_hoi_labels'] = args.hoi_loss_coef
 
     if args.use_matching:
         weight_dict['loss_matching'] = args.matching_loss_coef
@@ -541,7 +571,7 @@ def build(args):
         weight_dict.update(aux_weight_dict)
 
     # losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality', 'clip_labels']
-    losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality', 'clip_labels', 'clip_mimic']
+    losses = ['obj_labels', 'hoi_labels', 'sub_obj_boxes', 'obj_cardinality', 'clip_labels', 'clip_mimic']
     if args.use_matching:
         losses.append('matching_labels')
 

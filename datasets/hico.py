@@ -99,7 +99,7 @@ class HICODetection(torch.utils.data.Dataset):
 
             target['labels'] = target['labels'][:, 1]
 
-            obj_labels, verb_labels, sub_boxes, obj_boxes = [], [], [], []
+            obj_labels, verb_labels, hoi_labels, sub_boxes, obj_boxes = [], [], [], [], []
             
             # setup hoi_for_clip
             hoi_clip_labels = torch.zeros(len(self.hoi_text_label))
@@ -120,16 +120,23 @@ class HICODetection(torch.utils.data.Dataset):
                     hoi_clip_labels[self.hoi_text_label.index(verb_obj_pair)] = 1
                 
                 sub_obj_pair = (hoi['subject_id'], hoi['object_id'])
+
                 if sub_obj_pair in sub_obj_pairs:
                     verb_labels[sub_obj_pairs.index(sub_obj_pair)][self._valid_verb_ids.index(hoi['category_id'])] = 1
+                    hoi_labels[sub_obj_pairs.index(sub_obj_pair)][self.hoi_text_label.index(verb_obj_pair)] = 1
                 else:
                     sub_obj_pairs.append(sub_obj_pair)
                     obj_labels.append(target['labels'][kept_box_indices.index(hoi['object_id'])])
                     verb_label = [0 for _ in range(len(self._valid_verb_ids))]
                     verb_label[self._valid_verb_ids.index(hoi['category_id'])] = 1
+
+                    hoi_label = [0] * len(self.hoi_text_label)
+                    hoi_label[self.hoi_text_label.index(verb_obj_pair)] = 1
+
                     sub_box = target['boxes'][kept_box_indices.index(hoi['subject_id'])]
                     obj_box = target['boxes'][kept_box_indices.index(hoi['object_id'])]
                     verb_labels.append(verb_label)
+                    hoi_labels.append(hoi_label)
                     sub_boxes.append(sub_box)
                     obj_boxes.append(obj_box)
 
@@ -139,19 +146,19 @@ class HICODetection(torch.utils.data.Dataset):
             if len(sub_obj_pairs) == 0:
                 target['obj_labels'] = torch.zeros((0,), dtype=torch.int64)
                 target['verb_labels'] = torch.zeros((0, len(self._valid_verb_ids)), dtype=torch.float32)
+                target['hoi_labels'] = torch.zeros((0, len(self.hoi_text_label)), dtype=torch.float32)
                 target['sub_boxes'] = torch.zeros((0, 4), dtype=torch.float32)
                 target['obj_boxes'] = torch.zeros((0, 4), dtype=torch.float32)
                 target['matching_labels'] = torch.zeros((0,), dtype=torch.int64)
             else:
                 target['obj_labels'] = torch.stack(obj_labels)
                 target['verb_labels'] = torch.as_tensor(verb_labels, dtype=torch.float32)
+                target['hoi_labels'] = torch.as_tensor(hoi_labels, dtype=torch.float32)
                 target['sub_boxes'] = torch.stack(sub_boxes)
                 target['obj_boxes'] = torch.stack(obj_boxes)
                 target['matching_labels'] = torch.ones_like(target['obj_labels'])
-
-            # print("^^^^^^^^^^^^^^" 
-            # + str(target['hoi_clip_labels'].sum() == hoi_clip_labels.sum()) 
-            # + "^^^^^^^^^^^^^")
+            
+            # print(target['hoi_labels'].shape)
 
         else:
             target['filename'] = img_anno['file_name']

@@ -9,7 +9,7 @@ import itertools
 import torch
 
 import util.misc as utils
-from datasets.hico_eval import HICOEvaluator
+from datasets.hico_eval_triplet import HICOEvaluator
 from datasets.vcoco_eval import VCOCOEvaluator
 
 
